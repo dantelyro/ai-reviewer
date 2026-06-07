@@ -1,0 +1,49 @@
+# Reusable GitLab CI template: Claude merge-request review.
+#
+# A Node repo opts in by including this template from the central ai-platform
+# repo and setting the required CI/CD variables:
+#
+#   include:
+#     - project: 'your-group/ai-platform'
+#       file: 'ci/templates/mr-review.yml'
+#
+# Required CI/CD variables (Settings > CI/CD > Variables, masked):
+#   ANTHROPIC_API_KEY      Anthropic API key
+#   MCP_SERVER_URL         https URL of the always-on MCP server (e.g.
+#                          https://mcp.example.com/mcp)
+#   MCP_AUTH_TOKEN         bearer token the MCP server expects
+#   GITLAB_TOKEN           token with `api` scope, used to post MR comments
+#   AI_PLATFORM_REPO_URL   clone URL of the ai-platform repo, including an
+#                          access token, e.g.
+#                          https://gitlab-ci-token:${AI_PLATFORM_TOKEN}@gitlab.example.com/your-group/ai-platform.git
+#
+# Notes:
+#   * Uses the stock `python:3.12-slim` image -- the one runtime dependency.
+#     git is installed at job start (needed to compute the MR diff).
+#   * The review scripts, prompts, and rules live in ai-platform and are cloned
+#     fresh each run, so behaviour changes ship from one place.
+
+claude_mr_review:
+  image: python:3.12-slim
+  stage: test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  variables:
+    # Full clone so review.py can diff base..head.
+    GIT_DEPTH: "0"
+    AI_PLATFORM_DIR: "/tmp/ai-platform"
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates
+    - git clone --depth 1 "$AI_PLATFORM_REPO_URL" "$AI_PLATFORM_DIR"
+    - pip install --quiet --no-cache-dir -r "$AI_PLATFORM_DIR/scripts/requirements.txt"
+  script:
+    # Make sure the base commit is present for the diff.
+    - git fetch --no-tags origin "$CI_MERGE_REQUEST_DIFF_BASE_SHA" || true
+    - python "$AI_PLATFORM_DIR/scripts/review.py"
+    - python "$AI_PLATFORM_DIR/scripts/post-review.py" findings.json
+  artifacts:
+    when: always
+    paths:
+      - findings.json
+    expire_in: 1 week
+  allow_failure: true

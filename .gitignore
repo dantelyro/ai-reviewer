@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Review artifacts
+findings.json
+
+# Cloned/mounted repos served by the MCP server
+repos/
+
+# Local env files
+.env
+.env.*
+!.env.example

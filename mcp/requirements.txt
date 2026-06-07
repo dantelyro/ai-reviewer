@@ -1,0 +1,5 @@
+# MCP server runtime dependencies.
+# Pin within compatible ranges; bump deliberately.
+mcp>=1.2,<2
+uvicorn>=0.30
+starlette>=0.37
