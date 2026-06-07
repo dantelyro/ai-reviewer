@@ -15,6 +15,8 @@ Design notes
   head SHA as ``ref`` for a consistent view.
 * Every repository lives as a clone/worktree directly under ``REPOS_ROOT``.
   The ``repo`` argument is a bare directory name; path traversal is rejected.
+* If a repo is not cloned yet, the server resolves its URL via the GitLab API
+  and clones it automatically. If a requested commit SHA is missing, it fetches.
 * The Anthropic connector requires an ``https://`` URL and sends the
   ``authorization_token`` as ``Authorization: Bearer <token>``. When
   ``MCP_AUTH_TOKEN`` is set, every request is checked against it.
@@ -26,11 +28,13 @@ MCP_PORT          bind port (default 5000)
 MCP_PATH          Streamable HTTP path (default /mcp)
 REPOS_ROOT        directory containing the cloned repos (default ./repos)
 MCP_AUTH_TOKEN    shared bearer token; if unset, auth is disabled (dev only)
-GIT_FETCH_ON_MISS if "1", run `git fetch` once when a ref is missing (default 0)
+GITLAB_URL        GitLab instance URL (e.g. https://gitlab.example.com)
+GITLAB_TOKEN      GitLab token with read_repository scope (for auto-clone)
 
 Run locally:
     pip install -r requirements.txt
-    REPOS_ROOT=/srv/repos MCP_AUTH_TOKEN=dev-token python server.py
+    REPOS_ROOT=/srv/repos MCP_AUTH_TOKEN=dev-token \\
+    GITLAB_URL=https://gitlab.example.com GITLAB_TOKEN=glpat-... python server.py
 """
 
 from __future__ import annotations
@@ -38,6 +42,10 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import urllib.parse
+import urllib.request
+import urllib.error
+import json
 from pathlib import Path
 
 import uvicorn
@@ -52,8 +60,10 @@ from starlette.responses import JSONResponse
 
 REPOS_ROOT = Path(os.environ.get("REPOS_ROOT", "./repos")).resolve()
 MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "").strip()
-GIT_FETCH_ON_MISS = os.environ.get("GIT_FETCH_ON_MISS", "0") == "1"
+GITLAB_URL = os.environ.get("GITLAB_URL", "").rstrip("/")
+GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "").strip()
 GIT_TIMEOUT = 30  # seconds per git invocation
+GIT_CLONE_TIMEOUT = 300
 
 mcp = FastMCP(
     name="ai-platform",
@@ -72,19 +82,56 @@ class ToolError(Exception):
     """Raised for invalid input or git failures; surfaced to Claude as text."""
 
 
+def _gitlab_clone_url(repo: str) -> str:
+    """Look up the clone URL for ``repo`` via the GitLab API."""
+    if not GITLAB_URL or not GITLAB_TOKEN:
+        raise ToolError(
+            f"Repo {repo!r} is not cloned and GITLAB_URL/GITLAB_TOKEN are not set "
+            f"for auto-clone. Available: {', '.join(_list_repos()) or '(none)'}"
+        )
+    encoded = urllib.parse.quote(repo, safe="")
+    url = f"{GITLAB_URL}/api/v4/projects?search={encoded}&simple=true&per_page=10"
+    req = urllib.request.Request(url)
+    req.add_header("PRIVATE-TOKEN", GITLAB_TOKEN)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            projects = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise ToolError(f"GitLab API error {e.code} looking up {repo!r}")
+    # Find exact name match (search is fuzzy).
+    matches = [p for p in projects if p.get("path") == repo or p.get("name") == repo]
+    if not matches:
+        raise ToolError(f"Repo {repo!r} not found in GitLab. Check the name.")
+    clone_url = matches[0].get("http_url_to_repo", "")
+    if not clone_url:
+        raise ToolError(f"Could not get clone URL for {repo!r} from GitLab")
+    # Embed the token so the clone doesn't need interactive auth.
+    parsed = urllib.parse.urlparse(clone_url)
+    authed = parsed._replace(netloc=f"oauth2:{GITLAB_TOKEN}@{parsed.hostname}"
+                             + (f":{parsed.port}" if parsed.port else ""))
+    return urllib.parse.urlunparse(authed)
+
+
 def _resolve_repo(repo: str) -> Path:
-    """Validate ``repo`` and return its absolute path under REPOS_ROOT."""
+    """Validate ``repo``, auto-cloning from GitLab if not present locally."""
     if not repo or "/" in repo or "\\" in repo or repo in (".", ".."):
         raise ToolError(f"Invalid repo name: {repo!r}")
     path = (REPOS_ROOT / repo).resolve()
-    # Guard against traversal via symlinks or odd names.
     if path.parent != REPOS_ROOT:
         raise ToolError(f"Invalid repo name: {repo!r}")
     if not (path / ".git").exists():
-        raise ToolError(
-            f"Repo {repo!r} not found under REPOS_ROOT. "
-            f"Available: {', '.join(_list_repos()) or '(none)'}"
+        print(f"Repo {repo!r} not found locally — cloning from GitLab...")
+        clone_url = _gitlab_clone_url(repo)
+        REPOS_ROOT.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(
+            ["git", "clone", clone_url, str(path)],
+            capture_output=True,
+            text=True,
+            timeout=GIT_CLONE_TIMEOUT,
         )
+        if proc.returncode != 0:
+            raise ToolError(f"git clone failed for {repo!r}: {proc.stderr.strip()}")
+        print(f"Cloned {repo!r} into {path}")
     return path
 
 
@@ -120,15 +167,14 @@ def _git(repo_path: Path, *args: str) -> str:
 
 
 def _ensure_ref(repo_path: Path, ref: str) -> None:
-    """Optionally fetch once if ``ref`` is not present locally."""
-    if not GIT_FETCH_ON_MISS:
-        return
+    """Fetch if ``ref`` is not present in the local clone."""
     check = subprocess.run(
         ["git", "-C", str(repo_path), "cat-file", "-e", f"{ref}^{{commit}}"],
         capture_output=True,
         timeout=GIT_TIMEOUT,
     )
     if check.returncode != 0:
+        print(f"Ref {ref!r} not found in {repo_path.name} — fetching...")
         subprocess.run(
             ["git", "-C", str(repo_path), "fetch", "--quiet", "--all"],
             capture_output=True,
@@ -294,10 +340,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 
 def main() -> None:
-    if not REPOS_ROOT.exists():
-        raise SystemExit(f"REPOS_ROOT does not exist: {REPOS_ROOT}")
+    REPOS_ROOT.mkdir(parents=True, exist_ok=True)
     if not MCP_AUTH_TOKEN:
         print("WARNING: MCP_AUTH_TOKEN is unset -- the server is unauthenticated.")
+    if not GITLAB_URL or not GITLAB_TOKEN:
+        print("WARNING: GITLAB_URL/GITLAB_TOKEN not set -- auto-clone disabled.")
     print(f"Serving repos from {REPOS_ROOT}: {', '.join(_list_repos()) or '(none)'}")
 
     app = mcp.streamable_http_app()
